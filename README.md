@@ -1,4 +1,4 @@
-# Bootstrapping MAE
+# Bootstrapped MAE
 
 This repository implements Bootstrapped MAE, EMA-MAE, and its soft version. The code is based on the original MAE repository: [MAE GitHub Repo](https://github.com/facebookresearch/mae).
 
