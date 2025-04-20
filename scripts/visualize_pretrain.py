@@ -8,37 +8,28 @@
 # DeiT: https://github.com/facebookresearch/deit
 # BEiT: https://github.com/microsoft/unilm/tree/master/beit
 # --------------------------------------------------------
+"""
+Visualize the pre-trained MAE model on CIFAR10 dataset, work for MAE-1 and soft version of EMA
+Usage is same as the main_finetune.py
+"""
 
 import argparse
-import datetime
-import json
+from copy import deepcopy
 import numpy as np
 import os
-import time
 from pathlib import Path
 
 import torch
 import torch.backends.cudnn as cudnn
-from torch.utils.tensorboard import SummaryWriter
-
 import timm
 
-from util.crop import RandomResizedCrop
+import models_mae
 
 assert timm.__version__ == "0.3.2" # version check
-from timm.models.layers import trunc_normal_
-from timm.data.mixup import Mixup
-from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 
-import util.lr_decay as lrd
 import util.misc as misc
-from util.datasets import build_dataset
 from util.pos_embed import interpolate_pos_embed
-from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
-import models_vit
-
-from engine_finetune import train_one_epoch, evaluate
 import torchvision.transforms as transforms
 from torchvision.datasets import CIFAR10
 
@@ -49,6 +40,18 @@ def get_args_parser():
     parser.add_argument('--epochs', default=50, type=int)
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
+    parser.add_argument('--bootstrap_k', type=int, default=1,
+                        help='number of bootstrap epochs, 1 means original MAE')
+    parser.add_argument('--feature_layer', type=int, default=8,
+                        help='the layer to extract features for bootstrap, total 11')
+    parser.add_argument('--use_decoder_feature', dest='use_decoder_feature', action='store_true', help='use decoder feature (default: True)')
+    parser.add_argument('--not_use_decoder_feature', dest='use_decoder_feature', action='store_false', help='do not use decoder feature')
+    parser.set_defaults(use_decoder_feature=True)
+    parser.add_argument('--use_ema', action='store_true', 
+                        help='use EMA model')
+    parser.add_argument('--soft_version', action='store_true',
+                        help='use soft version of MAE')
+
 
     # Model parameters
     parser.add_argument('--model', default='vit_large_patch16', type=str, metavar='MODEL',
@@ -173,23 +176,27 @@ def main(args):
 
     cudnn.benchmark = True
 
-    # dataset_train = build_dataset(is_train=True, args=args)
-    # dataset_val = build_dataset(is_train=False, args=args)
-    transform_train = transforms.Compose([
-        RandomResizedCrop(32, interpolation=3),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2023, 0.1994, 0.2010])
-    ])
     transform_val = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2023, 0.1994, 0.2010])
     ])
 
-    dataset_train = CIFAR10(root=args.data_path,
-                      train=True,
-                      download=True,
-                      transform=transform_train)
+    class DeNormalize(object):
+        def __init__(self, mean, std):
+            self.mean = torch.tensor(mean)
+            self.std = torch.tensor(std)
+
+        def __call__(self, tensor):
+            # tensor shape: (C, H, W)
+            mean = self.mean.to(tensor.device)
+            std = self.std.to(tensor.device)
+            return tensor * std[:, None, None] + mean[:, None, None]
+
+    inv_transform = transforms.Compose([
+        DeNormalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010]),
+        transforms.ToPILImage()
+    ])
+
     dataset_val = CIFAR10(root=args.data_path,
                       train=False,
                       download=True,
@@ -198,10 +205,6 @@ def main(args):
     if True:  # args.distributed:
         num_tasks = misc.get_world_size()
         global_rank = misc.get_rank()
-        sampler_train = torch.utils.data.DistributedSampler(
-            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-        )
-        print("Sampler_train = %s" % str(sampler_train))
         if args.dist_eval:
             if len(dataset_val) % num_tasks != 0:
                 print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
@@ -212,22 +215,8 @@ def main(args):
         else:
             sampler_val = torch.utils.data.SequentialSampler(dataset_val)
     else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-    if global_rank == 0 and args.log_dir is not None and not args.eval:
-        os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.log_dir)
-    else:
-        log_writer = None
-
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=True,
-    )
 
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val, sampler=sampler_val,
@@ -237,46 +226,20 @@ def main(args):
         drop_last=False
     )
 
-    mixup_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-    if mixup_active:
-        print("Mixup is activated!")
-        mixup_fn = Mixup(
-            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
-            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-            label_smoothing=args.smoothing, num_classes=args.nb_classes)
     
-    model = models_vit.__dict__[args.model](
-        num_classes=args.nb_classes,
-        drop_path_rate=args.drop_path,
-        global_pool=args.global_pool,
-    )
+    model = models_mae.__dict__[args.model](bootstrap_k=args.bootstrap_k, feature_layer=args.feature_layer, use_ema=args.use_ema, use_decoder_feature=args.use_decoder_feature, soft_version=args.soft_version)
 
     if args.finetune and not args.eval:
         checkpoint = torch.load(args.finetune, map_location='cpu')
 
         print("Load pre-trained checkpoint from: %s" % args.finetune)
         checkpoint_model = checkpoint['model']
-        state_dict = model.state_dict()
-        for k in ['head.weight', 'head.bias']:
-            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                print(f"Removing key {k} from pretrained checkpoint")
-                del checkpoint_model[k]
 
         # interpolate position embedding
         interpolate_pos_embed(model, checkpoint_model)
 
         # load pre-trained model
-        msg = model.load_state_dict(checkpoint_model, strict=False)
-        print(msg)
-
-        if args.global_pool:
-            assert set(msg.missing_keys) == {'head.weight', 'head.bias', 'fc_norm.weight', 'fc_norm.bias'}
-        else:
-            assert set(msg.missing_keys) == {'head.weight', 'head.bias'}
-
-        # manually initialize fc layer
-        trunc_normal_(model.head.weight, std=2e-5)
+        model.load_state_dict(checkpoint_model, strict=True)
 
     model.to(device)
 
@@ -286,90 +249,51 @@ def main(args):
     print("Model = %s" % str(model_without_ddp))
     print('number of params (M): %.2f' % (n_parameters / 1.e6))
 
-    eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
-    
-    if args.lr is None:  # only base_lr is specified
-        args.lr = args.blr * eff_batch_size / 256
-
-    print("base lr: %.2e" % (args.lr * 256 / eff_batch_size))
-    print("actual lr: %.2e" % args.lr)
-
-    print("accumulate grad iterations: %d" % args.accum_iter)
-    print("effective batch size: %d" % eff_batch_size)
 
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
 
-    # build optimizer with layer-wise lr decay (lrd)
-    param_groups = lrd.param_groups_lrd(model_without_ddp, args.weight_decay,
-        no_weight_decay_list=model_without_ddp.no_weight_decay(),
-        layer_decay=args.layer_decay
-    )
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
-    loss_scaler = NativeScaler()
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    header = 'Test:'
 
-    if mixup_fn is not None:
-        # smoothing is handled with mixup label transform
-        criterion = SoftTargetCrossEntropy()
-    elif args.smoothing > 0.:
-        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-    else:
-        criterion = torch.nn.CrossEntropyLoss()
+    # switch to evaluation mode
+    model.eval()
 
-    print("criterion = %s" % str(criterion))
+    for batch in metric_logger.log_every(data_loader_val, 10, header):
+        images = batch[0]
+        target = batch[-1]
+        images = images.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True)
 
-    misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
-
-    if args.eval:
-        test_stats = evaluate(data_loader_val, model, device)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        exit(0)
-
-    print(f"Start training for {args.epochs} epochs")
-    start_time = time.time()
-    max_accuracy = 0.0
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
-        train_stats = train_one_epoch(
-            model, criterion, data_loader_train,
-            optimizer, device, epoch, loss_scaler,
-            args.clip_grad, mixup_fn,
-            log_writer=log_writer,
-            args=args
-        )
-        if args.output_dir and (epoch + 1 == args.epochs):
-            misc.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch)
-
-        test_stats = evaluate(data_loader_val, model, device)
-        print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-        max_accuracy = max(max_accuracy, test_stats["acc1"])
-        print(f'Max accuracy: {max_accuracy:.2f}%')
-
-        if log_writer is not None:
-            log_writer.add_scalar('perf/test_acc1', test_stats['acc1'], epoch)
-            log_writer.add_scalar('perf/test_acc5', test_stats['acc5'], epoch)
-            log_writer.add_scalar('perf/test_loss', test_stats['loss'], epoch)
-
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                        **{f'test_{k}': v for k, v in test_stats.items()},
-                        'epoch': epoch,
-                        'n_parameters': n_parameters}
-
-        if args.output_dir and misc.is_main_process():
-            if log_writer is not None:
-                log_writer.flush()
-            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-                f.write(json.dumps(log_stats) + "\n")
-
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time {}'.format(total_time_str))
-
-
+        # compute output
+        with torch.cuda.amp.autocast():
+            loss, output, mask = model(deepcopy(images))
+            p = 4
+            h = w = int(output.shape[1]**.5)
+            output = output.reshape(shape=(output.shape[0], h, w, p, p, 3))
+            output = torch.einsum('nhwpqc->nchpwq', output)
+            pred_imgs = output.reshape(shape=(output.shape[0], 3, h * p, h * p))
+            for i in range(pred_imgs.shape[0]):
+                pred_img = pred_imgs[i]
+                pred_img = inv_transform(pred_img)
+                os.makedirs(f'visualize/{i}', exist_ok=True)
+                pred_img.save(f'visualize/{i}/{args.finetune.split("/")[1]}.png')
+                original_img = deepcopy(images[i])
+                original_img = inv_transform(original_img)
+                original_img.save(f'visualize/{i}/original.png')
+            
+            # feat_pixel_pred = model.visualize_decoder_feature(deepcopy(images))
+            # feat_pixel_pred = feat_pixel_pred.reshape(shape=(feat_pixel_pred.shape[0], h, w, p, p, 3))
+            # feat_pixel_pred = torch.einsum('nhwpqc->nchpwq', feat_pixel_pred)
+            # feat_pixel_pred = feat_pixel_pred.reshape(shape=(feat_pixel_pred.shape[0], 3, h * p, h * p))
+            # for i in range(feat_pixel_pred.shape[0]):
+            #     feat_img = feat_pixel_pred[i]
+            #     feat_img = inv_transform(feat_img)
+            #     os.makedirs(f'visualize/{i}', exist_ok=True)
+            #     feat_img.save(f'visualize/{i}/{args.finetune.split("/")[1]}_feature.png')
+        break
+    
 if __name__ == '__main__':
     args = get_args_parser()
     args = args.parse_args()

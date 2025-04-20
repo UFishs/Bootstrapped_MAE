@@ -1,0 +1,9 @@
+cifar-10-dataset/
+tmp/
+MAE*/
+problem.md
+
+__pycache__/
+*.pyc
+visualize/
+read_result.py

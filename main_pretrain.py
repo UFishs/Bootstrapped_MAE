@@ -43,6 +43,27 @@ def get_args_parser():
     parser.add_argument('--accum_iter', default=1, type=int,
                         help='Accumulate gradient iterations (for increasing the effective batch size under memory constraints)')
 
+    # bootstrap parameters
+    parser.add_argument('--bootstrap_k', type=int, default=1,
+                        help='number of bootstrap epochs, 1 means original MAE')
+    parser.add_argument('--feature_layer', type=int, default=8,
+                        help='the layer to extract features for bootstrap, total 11')
+    parser.add_argument('--use_decoder_feature', dest='use_decoder_feature', action='store_true', help='use decoder feature (default: True)')
+    parser.add_argument('--not_use_decoder_feature', dest='use_decoder_feature', action='store_false', help='do not use decoder feature')
+    parser.set_defaults(use_decoder_feature=True)
+
+    # EMA parameters
+    parser.add_argument('--use_ema', action='store_true', 
+                        help='use EMA model')
+    parser.add_argument('--ema_decay', type=float, default=0.9999,
+                        help='decay rate for EMA update')
+    parser.add_argument('--ema_warmup', type=int, default=0,
+                        help='number of warmup epochs for EMA update')
+
+    # soft version parameters
+    parser.add_argument('--soft_version', action='store_true',
+                        help='use soft version of MAE')
+
     # Model parameters
     parser.add_argument('--model', default='mae_vit_large_patch16', type=str, metavar='MODEL',
                         help='Name of model to train')
@@ -124,8 +145,16 @@ def main(args):
             transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+            # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]) # for ImageNet
+            transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2023, 0.1994, 0.2010]) # for CIFAR10
+            ])
+    # dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+    dataset_train = datasets.CIFAR10(
+        root=args.data_path,
+        train=True,
+        download=True,
+        transform=transform_train
+    )
     print(dataset_train)
 
     if True:  # args.distributed:
@@ -153,12 +182,22 @@ def main(args):
     )
     
     # define the model
-    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
+    model = models_mae.__dict__[args.model](
+        norm_pix_loss=args.norm_pix_loss,
+        bootstrap_k=args.bootstrap_k, 
+        feature_layer=args.feature_layer,
+        use_ema=args.use_ema, 
+        ema_decay=args.ema_decay, 
+        ema_warmup=args.ema_warmup, 
+        use_decoder_feature=args.use_decoder_feature, 
+        soft_version=args.soft_version, 
+        total_epoch=args.epochs
+    )
 
     model.to(device)
 
     model_without_ddp = model
-    print("Model = %s" % str(model_without_ddp))
+    # print("Model = %s" % str(model_without_ddp))
 
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
     
@@ -183,11 +222,20 @@ def main(args):
 
     misc.load_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler)
 
+    assert not (args.use_ema and args.bootstrap_k > 1), "EMA and bootstrap cannot be used together"
+    assert not (args.bootstrap_k > 1 and args.soft_version), "Bootstrap and soft version cannot be used together"
+
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
+        
+        # bootstrap
+        if args.bootstrap_k > 1 and epoch % (args.epochs // args.bootstrap_k) == 0 and epoch > 0:
+            print("Doing bootstrap: update target model")
+            model.update_target_network()
+
         train_stats = train_one_epoch(
             model, data_loader_train,
             optimizer, device, epoch, loss_scaler,
@@ -207,6 +255,7 @@ def main(args):
                 log_writer.flush()
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
+        model.epoch += 1
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
