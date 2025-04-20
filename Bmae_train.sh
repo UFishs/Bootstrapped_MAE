@@ -10,7 +10,6 @@ base_path="./bootstrap"
 USE_PIXEL_NORM=${4:-1}
 use_decoder_feature=${5:-1}
 
-# Demonstration of using parsed options
 echo "Using GPU ID: $gpu_id"
 echo "Pretrain using batch size: $batch_size"
 echo "base_path: $base_path"
@@ -19,22 +18,16 @@ echo "feature_layer: $feature_layer"
 echo "use pixel norm: $USE_PIXEL_NORM"
 echo "use decoder feature: $use_decoder_feature"
 
-# choose GPU
 export CUDA_VISIBLE_DEVICES=$gpu_id
 
-
-# define the network, dataset path, the path to save model and results
-MODEL="deit_tiny_patch4"  # choose model
-DATA_PATH="./cifar-10-dataset"  # the path of CIFAR10
+MODEL="deit_tiny_patch4"
+DATA_PATH="./cifar-10-dataset"
 img_size=32
 
 
-# hyperparameters
 LR=1e-4
 WEIGHT_DECAY=0.05
 EPOCHS=$epochs_sum
-
-
 
 
 if [ $USE_PIXEL_NORM = 1 ]; then
@@ -77,44 +70,3 @@ cmd=$cmd$NORM_PIX_LOSS$USE_DECODER_FEATURE
 
 echo "Running command: $cmd"
 eval $cmd
-
-
-# python main_pretrain.py \
-#     --model $MODEL \
-#     --data_path $DATA_PATH \
-#     --output_dir $OUTPUT_DIR \
-#     --log_dir $LOG_DIR \
-#     --batch_size $batch_size \
-#     --epochs $EPOCHS \
-#     --lr $LR \
-#     --weight_decay $WEIGHT_DECAY \
-#     --device cuda \
-#     --input_size $img_size \
-#     --bootstrap_k $bootstrap_k \
-#     --feature_layer $feature_layer \
-#     --norm_pix_loss
-
-
-# for k in $(seq 1 $bootstrap_k); do
-#     OUTPUT_DIR="$base_path/MAE-$k/output_dir"
-#     LOG_DIR="$base_path/MAE-$k/log_dir"
-#     pre_k=$((k-1))
-#     epochs_to_load=$((EPOCHS-1))
-#     check_point="$base_path/MAE-$pre_k/output_dir/checkpoint-$epochs_to_load.pth"
-
-#     python main_pretrain.py \
-#     --model $MODEL \
-#     --data_path $DATA_PATH \
-#     --output_dir $OUTPUT_DIR \
-#     --log_dir $LOG_DIR \
-#     --batch_size $batch_size \
-#     --epochs $EPOCHS \
-#     --lr $LR \
-#     --weight_decay $WEIGHT_DECAY \
-#     --device cuda \
-#     --input_size $img_size \
-#     --bootstrap_k $k \
-#     --feature_layer $feature_layer \
-#     --target_model_ckpt $check_point \
-#     --norm_pix_loss # forget to add previously
-# done

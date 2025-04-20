@@ -3,16 +3,14 @@ USE_PIXEL_NORM=${2:-1}
 USE_SOFT_VERSION=${3:-0}
 feature_layer=${4:-11}
 
-# choose GPU
 export CUDA_VISIBLE_DEVICES=$gpu_id
 echo "Using GPU: $gpu_id"
 echo "Using pixel norm: $USE_PIXEL_NORM"
 echo "Using soft version: $USE_SOFT_VERSION"
 echo "Feature layer: $feature_layer"
 
-# define the network and dataset path
-MODEL="vit_deit_tiny_patch4"  # choose model
-DATA_PATH="./cifar-10-dataset"  # the path of CIFAR10
+MODEL="vit_deit_tiny_patch4"
+DATA_PATH="./cifar-10-dataset"
 IMG_SIZE=32
 NB_CLASSES=10
 
@@ -40,18 +38,14 @@ else
 fi
 
 
-# define the path to save models and the log, and the save frequency
 OUTPUT_DIR="./$BASE_DIR/eval_linear/output_dir"
 LOG_DIR="./$BASE_DIR/eval_linear/log_dir"
-# SAVE_FREQ=20
 
-# hyperparameters
 BATCH_SIZE=256
 EPOCHS=100 # follow the requirement
 LR=1
 WEIGHT_DECAY=0
 
-# finetuning
 CHECK_POINT="./$BASE_DIR/pretrain/output_dir/checkpoint-199.pth"
 
 python main_linprobe.py \

@@ -3,17 +3,15 @@ USE_PIXEL_NORM=${2:-1}
 USE_SOFT_VERSION=${3:-0}
 feature_layer=${4:-11}
 
-# choose GPU
 export CUDA_VISIBLE_DEVICES=$gpu_id
 echo "Using GPU: $gpu_id"
 echo "Using pixel norm: $USE_PIXEL_NORM"
 echo "Using soft version: $USE_SOFT_VERSION"
 echo "Feature layer: $feature_layer"
 
-MODEL="deit_tiny_patch4"  # choose model
-DATA_PATH="./cifar-10-dataset"  # the path of CIFAR10
+MODEL="deit_tiny_patch4"
+DATA_PATH="./cifar-10-dataset"
 
-# define the path to save models and the log, and the save frequency
 BASE_DIR="MAE-1"
 if [ $USE_PIXEL_NORM = 1 ]; then
     echo "Using pixel norm"
@@ -41,7 +39,6 @@ fi
 OUTPUT_DIR="./$BASE_DIR/pretrain/output_dir"
 LOG_DIR="./$BASE_DIR/pretrain/log_dir"
 
-# hyperparameters
 BATCH_SIZE=256
 EPOCHS=200
 LR=1e-4
